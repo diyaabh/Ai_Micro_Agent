@@ -26,6 +26,8 @@ tokens/
 logs/
 *.sqlite3
 *.db-journal
+*.pdf
+
 
 # ----------------------------
 # Editor / IDE configs

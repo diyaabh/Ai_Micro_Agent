@@ -61,3 +61,12 @@ CREATE TABLE IF NOT EXISTS order_chat_session (
     store_chat_id TEXT,
     active INTEGER DEFAULT 1
 );
+
+-- Notes table: simple per-user notes stored by chat_id
+CREATE TABLE IF NOT EXISTS note (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_chat_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    pinned INTEGER DEFAULT 0
+);
