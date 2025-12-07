@@ -10,13 +10,23 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from src.tools.pdf_export import generate_notes_pdf
 from apscheduler.triggers.cron import CronTrigger
 
 # --- Load environment ---
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../.env"))
 
 # --- Local imports ---
-from src.db import get_conn, create_task, init_db
+from src.db import (
+    get_conn,
+    create_task,
+    init_db,
+    create_note,
+    list_notes,
+    delete_note,
+    pin_note,
+    unpin_note,
+)
 from src.tools.messaging import send_message
 from src.tools import orders
 from src.planner import call_ollama, extract_json_from_text
@@ -78,7 +88,8 @@ def register_user(chat_id, name, username):
     """Auto-register/update a user."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS user_registry (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id TEXT UNIQUE,
@@ -86,13 +97,16 @@ def register_user(chat_id, name, username):
             username TEXT,
             last_seen TEXT
         )
-    """)
+    """
+    )
     conn.commit()
     now = datetime.datetime.now(TZ).isoformat()
     cur.execute("""
         INSERT OR REPLACE INTO user_registry (chat_id, name, username, last_seen)
         VALUES (?, ?, ?, ?)
-    """, (str(chat_id), name, username, now))
+    """,
+        (str(chat_id), name, username, now),
+    )
     conn.commit()
     conn.close()
 
@@ -204,7 +218,10 @@ def persist_task_and_schedule(user_chat_id: str, plan_obj: dict):
         }
 
     else:
-        internal["calls"][0]["args"] = {"chat_id": str(user_chat_id), "text": plan_obj.get("text", "Reminder")}
+        internal["calls"][0]["args"] = {
+            "chat_id": str(user_chat_id),
+            "text": plan_obj.get("text", "Reminder"),
+        }
 
     conn = get_conn()
     cur = conn.cursor()
@@ -279,7 +296,12 @@ def process_message(msg):
         chat = msg.get("chat", {})
         chat_id = str(chat.get("id"))
         username = chat.get("username")
-        display_name = chat.get("title") or " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")])) or username or ""
+        display_name = (
+            chat.get("title")
+            or " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")]))
+            or username
+            or ""
+        )
         text = msg.get("text") or msg.get("caption") or ""
         if not text:
             return
@@ -292,7 +314,8 @@ def process_message(msg):
         try:
             conn = get_conn()
             cur = conn.cursor()
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS order_chat_session (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     order_id INTEGER,
@@ -300,13 +323,17 @@ def process_message(msg):
                     store_chat_id TEXT,
                     active INTEGER DEFAULT 1
                 )
-            """)
+            """
+            )
             conn.commit()
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT id, order_id, buyer_chat_id, store_chat_id
                 FROM order_chat_session
                 WHERE active=1 AND (buyer_chat_id=? OR store_chat_id=?)
-            """, (chat_id, chat_id))
+            """,
+                (chat_id, chat_id),
+            )
             sess = cur.fetchone()
             conn.close()
             if sess:
@@ -315,7 +342,10 @@ def process_message(msg):
                 if text.strip().lower() == "/endchat":
                     conn = get_conn()
                     cur = conn.cursor()
-                    cur.execute("UPDATE order_chat_session SET active=0 WHERE id=?", (sess_id,))
+                    cur.execute(
+                        "UPDATE order_chat_session SET active=0 WHERE id=?",
+                        (sess_id,),
+                    )
                     conn.commit()
                     conn.close()
                     send_message(buyer_cid, "💬 Chat closed.")
@@ -328,11 +358,173 @@ def process_message(msg):
         except Exception:
             pass
 
+        # ---------------- NOTES FEATURE ----------------
+        # /note <text>  -> create note
+        if text_lower.startswith("/note "):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 1 or not parts[1].strip():
+                send_message(chat_id, "Usage: /note <your note text>")
+                return
+            note_text = parts[1].strip()
+            try:
+                nid = create_note(str(chat_id), note_text)
+                send_message(chat_id, f"📝 Saved note #{nid}: {note_text}")
+            except Exception as e:
+                send_message(chat_id, f"⚠️ Failed to save note: {e}")
+            return
+
+        if text_lower.strip() == "/note":
+            send_message(chat_id, "Usage: /note <your note text>")
+            return
+
+        # /notes -> list notes
+        if text_lower.strip() == "/notes":
+            try:
+                rows = list_notes(str(chat_id))
+                if not rows:
+                    send_message(chat_id, "📭 You have no saved notes.")
+                    return
+
+                lines = ["🗒 *Your notes:*"]
+                for nid, note_text, created_at, pinned in rows:
+                    star = "⭐ " if pinned else ""
+                    lines.append(f"{star}{nid}) {note_text}")
+
+                lines.append("\nUse /pin_note <id> or /unpin_note <id> to manage pins.")
+                send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+            except Exception as e:
+                send_message(chat_id, f"⚠️ Failed to list notes: {e}")
+            return
+
+
+        # /delete_note <id>
+        if text_lower.startswith("/delete_note"):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 1 or not parts[1].strip():
+                send_message(chat_id, "Usage: /delete_note <note_id>")
+                return
+            arg = parts[1].strip()
+            if not arg.isdigit():
+                send_message(chat_id, "Note id must be a number.")
+                return
+            note_id = int(arg)
+            try:
+                ok = delete_note(str(chat_id), note_id)
+                if ok:
+                    send_message(chat_id, f"🗑 Deleted note #{note_id}.")
+                else:
+                    send_message(chat_id, f"⚠️ No note #{note_id} found.")
+            except Exception as e:
+                send_message(chat_id, f"⚠️ Failed to delete note: {e}")
+            return
+        # ---------------- END NOTES FEATURE ----------------
+
+                # /export_notes -> generate and send PDF
+        if text_lower.startswith("/export_notes"):
+            try:
+                notes = list_notes(str(chat_id))
+                if not notes:
+                    send_message(chat_id, "📭 You have no notes to export.")
+                    return
+
+                pdf_path = f"notes_{chat_id}.pdf"
+                generate_notes_pdf(notes, pdf_path)
+
+                # Send the PDF file
+                files = {
+                    "document": open(pdf_path, "rb")
+                }
+                data = {
+                    "chat_id": chat_id,
+                    "caption": "📄 Here is your exported notes PDF."
+                }
+
+                requests.post(f"{TG_BASE}/sendDocument", data=data, files=files)
+                send_message(chat_id, "✅ Notes exported successfully!")
+
+            except Exception as e:
+                send_message(chat_id, f"⚠️ Failed to export notes: {e}")
+
+            return
+
+
+        # ---------------- AGENDA FEATURE ----------------
+        # /agenda -> show today's agenda (reminders + notes)
+        if text_lower.startswith("/agenda"):
+            # Get today's date in your bot's timezone
+            now = datetime.datetime.now(TZ)
+            date_str = now.strftime("%A, %d %b %Y")
+
+            # 1) Fetch active reminders/orders from task table
+            try:
+                conn = get_conn()
+                cur = conn.cursor()
+                # Same approach as /list_reminders (no per-user filter yet)
+                cur.execute(
+                    "SELECT id, params_json, schedule_rule, enabled "
+                    "FROM task WHERE enabled=1"
+                )
+                task_rows = cur.fetchall()
+                conn.close()
+            except Exception as e:
+                task_rows = []
+                print("⚠️ Failed to fetch tasks for agenda:", e)
+
+            # Format reminders / tasks
+            task_lines = []
+            if task_rows:
+                for tid, params_json, rule, enabled in task_rows:
+                    try:
+                        params = json.loads(params_json)
+                        msg_text = params["calls"][0]["args"].get("text", "")
+                        plan = params.get("plan", "")
+                    except Exception:
+                        msg_text = "(unreadable)"
+                        plan = "unknown"
+                    task_lines.append(f"• [{tid}] ({plan}) {msg_text}  ⏱ {rule}")
+            else:
+                task_lines.append("• No active reminders or scheduled tasks.")
+
+            # 2) Fetch notes for this chat
+            try:
+                notes = list_notes(str(chat_id))
+            except Exception as e:
+                notes = []
+                print("⚠️ Failed to fetch notes for agenda:", e)
+
+            note_lines = []
+            if notes:
+                note_lines.append("Here are your latest notes:")
+                # show at most 5
+                for nid, note_text, created_at, pinned in notes[:5]:
+                    star = "⭐ " if pinned else ""
+                    note_lines.append(f"• {star}[{nid}] {note_text}")
+
+                if len(notes) > 5:
+                    note_lines.append(f"... and {len(notes) - 5} more. Use /notes to see all.")
+            else:
+                note_lines.append("You have no saved notes. Use `/note <text>` to add one.")
+
+            # Build final agenda message
+            lines = [
+                f"📅 *Agenda for {date_str}*",
+                "",
+                "🕒 *Reminders & Scheduled Tasks*",
+                *task_lines,
+                "",
+                "📝 *Notes*",
+                *note_lines,
+            ]
+
+            send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+            return
+        # ---------------- END AGENDA FEATURE ----------------
+
         # --- /start (updated manual text) ---
         if text_lower.startswith("/start"):
             welcome_text = (
                 "👋 Hello! I’m your *AI Micro Agent* — your smart assistant for reminders, "
-                "orders, and Gmail digests.\n\n"
+                "orders, notes, and Gmail digests.\n\n"
                 "Here’s what I can do:\n\n"
                 "🕒 *Reminders*\n"
                 "• `/remind drink water every 2 hours`\n"
@@ -343,6 +535,10 @@ def process_message(msg):
                 "• `/remind order milk in 2 hours from Capital Store` — one-time delayed order\n"
                 "• `/remind order milk every 2 days from Capital Store` — recurring order\n"
                 "• Chat continues until `/endchat`\n\n"
+                "📝 *Notes*\n"
+                "• `/note buy fruits` — save a note\n"
+                "• `/notes` — list your notes\n"
+                "• `/delete_note <id>` — delete a note\n\n"
                 "💌 *Email Digest*\n"
                 "• `/link_gmail` — link Gmail\n"
                 "• `/emailsummary` — fetch immediate summary\n"
@@ -436,14 +632,26 @@ def process_message(msg):
         if text_lower.startswith("/whoami"):
             conn = get_conn()
             cur = conn.cursor()
-            cur.execute("SELECT name, username, last_seen FROM user_registry WHERE chat_id=?", (chat_id,))
+            cur.execute(
+                "SELECT name, username, last_seen FROM user_registry WHERE chat_id=?",
+                (chat_id,),
+            )
             user_info = cur.fetchone()
             conn.close()
             if user_info:
                 name, uname, last_seen = user_info
-                send_message(chat_id, f"🆔 *Chat ID:* `{chat_id}`\n👤 *Name:* {name}\n📛 *Username:* @{uname or '—'}\n⏱ *Last Seen:* {last_seen}")
+                send_message(
+                    chat_id,
+                    f"🆔 *Chat ID:* `{chat_id}`\n"
+                    f"👤 *Name:* {name}\n"
+                    f"📛 *Username:* @{uname or '—'}\n"
+                    f"⏱ *Last Seen:* {last_seen}",
+                    parse_mode="Markdown",
+                )
             else:
-                send_message(chat_id, f"⚠️ You’re not registered yet. Try sending /start.")
+                send_message(
+                    chat_id, "⚠️ You’re not registered yet. Try sending /start."
+                )
             return
         
         # --- /status (kept) ---
@@ -476,7 +684,10 @@ def process_message(msg):
             try:
                 conn = get_conn()
                 cur = conn.cursor()
-                cur.execute("SELECT id, params_json, schedule_rule, enabled FROM task WHERE enabled=1")
+                cur.execute(
+                    "SELECT id, params_json, schedule_rule, enabled "
+                    "FROM task WHERE enabled=1"
+                )
                 rows = cur.fetchall()
                 conn.close()
 
@@ -493,11 +704,16 @@ def process_message(msg):
                     except Exception:
                         msg_text = "(unreadable)"
                         plan = "unknown"
-                    lines.append(f"🆔 *{tid}* → ({plan}) {msg_text}\n   ⏱ {rule}")
+                    lines.append(
+                        f"🆔 *{tid}* → ({plan}) {msg_text}\n   ⏱ {rule}"
+                    )
 
-                msg_body = "📋 *Active Reminders & Orders:*\n\n" + "\n\n".join(lines)
-                msg_body += "\n\nUse `/delete_reminder <id>` to delete a reminder."
-                send_message(chat_id, msg_body)
+                msg_body = (
+                    "📋 *Active Reminders & Orders:*\n\n"
+                    + "\n\n".join(lines)
+                    + "\n\nUse `/delete_reminder <id>` to delete a reminder."
+                )
+                send_message(chat_id, msg_body, parse_mode="Markdown")
             except Exception as e:
                 send_message(chat_id, f"⚠️ Failed to list reminders: {e}")
             return
@@ -512,7 +728,9 @@ def process_message(msg):
             try:
                 rid = int(parts[1])
             except ValueError:
-                send_message(chat_id, "Please provide a valid numeric reminder ID.")
+                send_message(
+                    chat_id, "Please provide a valid numeric reminder ID."
+                )
                 return
 
             try:
@@ -527,7 +745,11 @@ def process_message(msg):
                 if job:
                     job.remove()
 
-                send_message(chat_id, f"✅ Reminder *{rid}* deleted successfully.")
+                send_message(
+                    chat_id,
+                    f"✅ Reminder *{rid}* deleted successfully.",
+                    parse_mode="Markdown",
+                )
             except Exception as e:
                 send_message(chat_id, f"⚠️ Could not delete reminder {rid}: {e}")
             return
@@ -535,9 +757,12 @@ def process_message(msg):
         
 
         # --- /link_gmail command ---
-        if text_lower.startswith("/link_gmail") or text_lower.startswith("/connect_gmail"):
+        if text_lower.startswith("/link_gmail") or text_lower.startswith(
+            "/connect_gmail"
+        ):
             try:
                 from src.tools.email_summary import start_gmail_oauth
+
                 send_message(chat_id, "🔗 Starting Gmail link process...")
                 start_gmail_oauth(chat_id)
             except Exception as e:
@@ -548,11 +773,17 @@ def process_message(msg):
         if text_lower.startswith("/check_gmail"):
             try:
                 from src.tools.email_summary import check_gmail_link
+
                 linked = check_gmail_link(chat_id)
                 if linked:
-                    send_message(chat_id, "✅ Your Gmail is linked successfully.")
+                    send_message(
+                        chat_id, "✅ Your Gmail is linked successfully."
+                    )
                 else:
-                    send_message(chat_id, "⚠️ Your Gmail is not linked yet. Use /link_gmail to link.")
+                    send_message(
+                        chat_id,
+                        "⚠️ Your Gmail is not linked yet. Use /link_gmail to link.",
+                    )
             except Exception as e:
                 send_message(chat_id, f"⚠️ Failed to check Gmail link: {e}")
             return
@@ -561,6 +792,7 @@ def process_message(msg):
         if text_lower.startswith("/disconnect_gmail"):
             try:
                 from src.tools.email_summary import disconnect_gmail
+
                 disconnect_gmail(chat_id)
                 send_message(chat_id, "✅ Your Gmail has been unlinked.")
             except Exception as e:
@@ -571,7 +803,7 @@ def process_message(msg):
         if text_lower.startswith("/manual"):
             manual_text = (
                 "📖 *AI Micro Agent User Guide*\n\n"
-                "I can help you with reminders, orders, and Gmail summaries. Here’s how to use me:\n\n"
+                "I can help you with reminders, orders, notes, and Gmail summaries. Here’s how to use me:\n\n"
                 "🕒 *Reminders*\n"
                 "• `/remind drink water every 2 hours` — set a reminder\n"
                 "• `/list_reminders` — list all your reminders\n"
@@ -581,6 +813,10 @@ def process_message(msg):
                 "• `/remind order milk in 2 hours from Capital Store` — one-time delayed order\n"
                 "• `/remind order milk every 2 days from Capital Store` — recurring order\n"
                 "• Use `/endchat` to finish a buyer<->store chat\n\n"
+                "📝 *Notes*\n"
+                "• `/note buy fruits` — save a note\n"
+                "• `/notes` — list your notes\n"
+                "• `/delete_note <id>` — delete a note\n\n"
                 "💌 *Email Digest*\n"
                 "• `/link_gmail` — link your Gmail account\n"
                 "• `/emailsummary` — get an immediate Gmail digest (default 5)\n"
@@ -589,8 +825,7 @@ def process_message(msg):
                 "• `/emailsummary weekly on Mon at 9am` — schedule weekly digest\n\n"
                 "🧾 *Jobs & Info*\n"
                 "• `/list_jobs` — show scheduled jobs (next run times)\n"
-                "• `/whoami` — see your profile info\n"
-                "• `/status` — system job summary\n\n"
+                "• `/whoami` — see your profile info\n\n"
                 "Feel free to ask for help! 🚀"
             )
             send_message(chat_id, manual_text, parse_mode="Markdown")
@@ -610,7 +845,9 @@ def process_message(msg):
                     try:
                         nrt = job.next_run_time
                         if nrt:
-                            nrt_local = nrt.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+                            nrt_local = nrt.astimezone(TZ).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
                         else:
                             nrt_local = "—"
                     except Exception:
@@ -630,12 +867,20 @@ def process_message(msg):
                 m_count = re.match(r"^/emailsummary\s+(\d+)\s*$", text_lower)
                 if m_count:
                     maxn = int(m_count.group(1))
-                    send_message(chat_id, f"📬 Fetching your last {maxn} emails... please wait ⏳")
-                    gmail_oauth.send_daily_email_summary(chat_id, max_results=maxn)
+                    send_message(
+                        chat_id,
+                        f"📬 Fetching your last {maxn} emails... please wait ⏳",
+                    )
+                    gmail_oauth.send_daily_email_summary(
+                        chat_id, max_results=maxn
+                    )
                     return
 
                 # daily schedule: "emailsummary every day at 11am"
-                m_daily = re.search(r"every\s+day\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text_lower)
+                m_daily = re.search(
+                    r"every\s+day\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+                    text_lower,
+                )
                 if m_daily:
                     hour = int(m_daily.group(1))
                     minute = int(m_daily.group(2) or 0)
@@ -644,27 +889,48 @@ def process_message(msg):
                         hour += 12
                     elif ampm == "am" and hour == 12:
                         hour = 0
-                    rrule = f"RRULE:FREQ=DAILY;BYHOUR={hour};BYMINUTE={minute}"
-                    plan = {"task_type": "email_summary", "schedule_rule": rrule, "text": "Daily Gmail summary"}
+                    rrule = (
+                        f"RRULE:FREQ=DAILY;BYHOUR={hour};BYMINUTE={minute}"
+                    )
+                    plan = {
+                        "task_type": "email_summary",
+                        "schedule_rule": rrule,
+                        "text": "Daily Gmail summary",
+                    }
                     tid = persist_task_and_schedule(chat_id, plan)
                     if tid:
-                        send_message(chat_id, f"✅ Scheduled Gmail summary every day at {hour:02d}:{minute:02d}. (task id={tid})")
+                        send_message(
+                            chat_id,
+                            f"✅ Scheduled Gmail summary every day at {hour:02d}:{minute:02d}. (task id={tid})",
+                        )
                     else:
-                        send_message(chat_id, "⚠️ Failed to schedule daily Gmail summary.")
+                        send_message(
+                            chat_id,
+                            "⚠️ Failed to schedule daily Gmail summary.",
+                        )
                     return
 
                 # weekly schedule: "emailsummary every week on monday at 9am"
                 weekday_map = {
-                    "monday": "MO", "mon": "MO",
-                    "tuesday": "TU", "tue": "TU",
-                    "wednesday": "WE", "wed": "WE",
-                    "thursday": "TH", "thu": "TH",
-                    "friday": "FR", "fri": "FR",
-                    "saturday": "SA", "sat": "SA",
-                    "sunday": "SU", "sun": "SU"
+                    "monday": "MO",
+                    "mon": "MO",
+                    "tuesday": "TU",
+                    "tue": "TU",
+                    "wednesday": "WE",
+                    "wed": "WE",
+                    "thursday": "TH",
+                    "thu": "TH",
+                    "friday": "FR",
+                    "fri": "FR",
+                    "saturday": "SA",
+                    "sat": "SA",
+                    "sunday": "SU",
+                    "sun": "SU",
                 }
                 m_weekly = re.search(
-                    r"(?:every|weekly)\s*(?:week)?(?:\s*on)?\s*(mon|monday|tue|tuesday|wed|wednesday|thu|thursday|fri|friday|sat|saturday|sun|sunday)\b\s*(?:at\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?",
+                    r"(?:every|weekly)\s*(?:week)?(?:\s*on)?\s*"
+                    r"(mon|monday|tue|tuesday|wed|wednesday|thu|thursday|fri|friday|sat|saturday|sun|sunday)\b"
+                    r"\s*(?:at\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?",
                     text_lower,
                 )
                 if m_weekly:
@@ -677,17 +943,34 @@ def process_message(msg):
                     elif ampm == "am" and hour == 12:
                         hour = 0
                     byday = weekday_map.get(day_token, day_token.upper()[:2])
-                    rrule = f"RRULE:FREQ=WEEKLY;BYDAY={byday};BYHOUR={hour};BYMINUTE={minute}"
-                    plan = {"task_type": "email_summary", "schedule_rule": rrule, "text": f"Weekly Gmail summary ({byday})"}
+                    rrule = (
+                        f"RRULE:FREQ=WEEKLY;BYDAY={byday};"
+                        f"BYHOUR={hour};BYMINUTE={minute}"
+                    )
+                    plan = {
+                        "task_type": "email_summary",
+                        "schedule_rule": rrule,
+                        "text": f"Weekly Gmail summary ({byday})",
+                    }
                     tid = persist_task_and_schedule(chat_id, plan)
                     if tid:
-                        send_message(chat_id, f"✅ Scheduled weekly Gmail summary on {day_token.title()} at {hour:02d}:{minute:02d}. (task id={tid})")
+                        send_message(
+                            chat_id,
+                            f"✅ Scheduled weekly Gmail summary on "
+                            f"{day_token.title()} at {hour:02d}:{minute:02d}. (task id={tid})",
+                        )
                     else:
-                        send_message(chat_id, "⚠️ Failed to schedule weekly Gmail summary.")
+                        send_message(
+                            chat_id,
+                            "⚠️ Failed to schedule weekly Gmail summary.",
+                        )
                     return
 
                 # default immediate fetch
-                send_message(chat_id, "📬 Fetching your Gmail summary... please wait ⏳")
+                send_message(
+                    chat_id,
+                    "📬 Fetching your Gmail summary... please wait ⏳",
+                )
                 gmail_oauth.send_daily_email_summary(chat_id, max_results=5)
             except Exception as e:
                 send_message(chat_id, f"⚠️ Failed to get email summary: {e}")
@@ -711,7 +994,7 @@ def process_message(msg):
                     return
 
                 item_part = nl_original[:idx].replace("order", "", 1).strip()
-                store_part = nl_original[idx + len(" from "):].strip()
+                store_part = nl_original[idx + len(" from ") :].strip()
 
                 # recurring
                 m_recurring = re.search(r"every\s*(\d+)?\s*(second|seconds|minute|minutes|hour|hours|day|days|week|weeks)\b", nl)
@@ -797,10 +1080,12 @@ def process_message(msg):
             send_message(chat_id, f"Got it — I'll create a reminder for: \"{nl_original}\". Processing with Ollama...")
 
             system_prompt = (
-                "You are a JSON-only generator. Convert the user's instruction into a single JSON object "
-                "and output only that JSON object and nothing else. The JSON must have exactly these keys: "
+                "You are a JSON-only generator. Convert the user's instruction into a "
+                "single JSON object and output only that JSON object and nothing else. "
+                "The JSON must have exactly these keys: "
                 "\"task_type\" (one of 'reminder'|'bill_link'|'email_summary'), "
-                "\"schedule_rule\" (an iCalendar RRULE string like 'RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0'), "
+                "\"schedule_rule\" (an iCalendar RRULE string like "
+                "'RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0'), "
                 "\"text\" (the message to send).\n\n"
                 f"Input: {nl_original}\nOutput:"
             )
@@ -833,7 +1118,10 @@ def process_message(msg):
             if tid:
                 send_message(chat_id, f"✅ Created reminder (task id={tid}). I’ll remind you per the schedule.")
             else:
-                send_message(chat_id, "⚠️ Failed to create reminder. Please try again.")
+                send_message(
+                    chat_id,
+                    "⚠️ Failed to create reminder. Please try again.",
+                )
             return
 
     except Exception as e:
@@ -862,7 +1150,9 @@ def main_loop():
             params = {"timeout": 30}
             if offset:
                 params["offset"] = offset
-            r = requests.get(f"{TG_BASE}/getUpdates", params=params, timeout=40)
+            r = requests.get(
+                f"{TG_BASE}/getUpdates", params=params, timeout=40
+            )
             data = r.json()
             if not data.get("ok"):
                 time.sleep(2)
@@ -882,4 +1172,3 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
-
